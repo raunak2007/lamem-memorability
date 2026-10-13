@@ -1,123 +1,107 @@
-# Does an airborne thermal detector know when it is wrong?
+# Does an image-memorability model know when it's wrong?
 
-A small benchmark that fine-tunes an object detector on airborne thermal imagery, then degrades
-the test frame the way a drone's sensor loses a target in the field and watches two things at
-once: how far the detector's true accuracy (mAP) falls, and whether the confidence on its boxes
-stays honest as that happens. The question is whether a fielded perception system can tell from
-its own confidence that the sensor has gone bad. The short answer, here, is no.
+A frozen-backbone model predicts image memorability at the human consistency ceiling,
+wrapped in a layer that reports when its predictions can be trusted and when they
+can't, then reframes that trust as the decision a creative-testing product actually
+makes: which of two creatives is more memorable, and when is that call confident
+enough to skip a panel.
 
-**One-pager with the figures and the full result: [`thermal_calibration_onepager.pdf`](thermal_calibration_onepager.pdf).**
+Built on [LaMem](http://memorability.csail.mit.edu/) (~60k images with human
+memorability scores). Everything runs on [Modal](https://modal.com).
 
-## What it finds
+## Results
 
-Fine-tuned on HIT-UAV thermal person detection, the detector scores mAP@0.5 of 92.2 on clean
-frames. Under every realistic degradation (range detail-loss, atmospheric blur, low thermal
-contrast, sensor noise, motion blur) its true accuracy collapses, while a dead control that only
-touches background pixels stays flat, so the collapse is a real reaction to the degraded targets.
+| model | Spearman ρ | notes |
+|---|---|---|
+| **CLIP ViT-B/32 + ridge** | **0.699** | at the human split-half consistency ceiling (ρ ≈ 0.68) |
+| ResNet18 + ridge | 0.619 ± 0.009 | mean over the 5 official splits |
+| pixel brightness | 0.097 | trivial-feature floor |
 
-- **It fails by going blind, not by lying.** The mechanism is recall collapse. Under the three
-  harshest degradations, detections fall from ~2500 to as few as 20 and recall from 96% to under
-  6%. mAP collapses because targets are missed, not because the surviving boxes are confidently
-  wrong (the survivors are mostly *more* precise than on clean).
-- **The confidence does not track it.** Mean box confidence falls far less than accuracy, and the
-  confidence becomes badly miscalibrated, D-ECE rising from 0.17 to ~0.47–0.49, in the
-  under-confident direction. The confidence stream neither spikes nor stays calibrated, so it will
-  not tell you the sensor has degraded or how many targets you are now missing.
-- **The ranking still triages.** Keeping only the top quarter of detections by confidence holds
-  precision near 99% on clean and under degradation alike. That certifies the detections you keep,
-  not the targets already missed.
-- **It is a property of the detector, not the floor model.** YOLOv8s (3x the parameters)
-  reproduces every part of this, down to the same motion-blur calibration exception. The larger
-  model does not even beat the smaller on clean.
-- **The standard fix backfires.** Temperature scaling fit on clean (the calibration you could
-  actually deploy) makes the degraded D-ECE 26% *worse*, not better, because clean wants to sharpen
-  its confidence and degraded wants to soften it, opposite directions a single scalar can't serve.
-  Even the oracle per-condition temperature only halves it. You cannot calibrate your way out of a
-  distribution shift from in-distribution data. See the appendix in the one-pager; run it with
-  `python temp_scaling.py`.
+Point-estimate error (CLIP, n = 10k held-out): MAE 0.069, RMSE 0.088. The backbone is
+frozen; only a ridge head and the trust layer are fit, so the whole thing trains in
+minutes and is cheap to reproduce.
 
-Every number carries a frame-level bootstrap confidence interval; two caveats are stated rather
-than hidden (atmospheric blur's D-ECE rests on only 20 detections, and motion blur genuinely
-stays calibrated).
+## The trust layer
+
+A score is only useful if you know when to believe it.
+
+**Calibration.** A heteroscedastic variance head gives per-item intervals. Raw
+intervals are overconfident, so split-conformal calibration corrects them to
+near-exact coverage with a finite-sample guarantee:
+
+| nominal | 0.50 | 0.80 | 0.90 | 0.95 |
+|---|---|---|---|---|
+| empirical | 0.504 | 0.805 | 0.905 | 0.953 |
+
+**Selective prediction.** Keeping the most-confident 30% drops MAE from 0.069 to 0.058.
+
+**Group-conditional coverage.** The 90% guarantee holds within every predicted-score
+quartile (0.90 to 0.92), not just on average.
+
+**An honest negative.** Per-item variance is a *weak* error ranker (std-vs-error
+Spearman 0.14). That limitation is load-bearing below.
+
+## Creative selection under a testing budget
+
+The result that maps to a creative-testing product. A product rarely needs an image's
+absolute memorability score; it needs the right **decision** between creatives and a
+confidence it can act on. Reframing the same model as an A/B selector, on 5k held-out
+images:
+
+- On random creative pairs, it picks the more memorable one **74%** of the time (50% is chance).
+- Shown 5 candidates, its top pick is the true best **50%** of the time (20% chance); shown 10, it lands in the true top 2 **58%** of the time.
+- **Which confidence to gate on.** The per-item variance is weak, but the *margin* between two predictions is strong. Automating the most-confident half of A/B calls **by margin** holds **87%** accuracy; by per-item variance, only 73%. Gate on the margin, not the error bar.
+
+So the model is a far better chooser than scorer, and it knows which of its own calls
+to stand behind. That is the product rule: auto-decide the confident calls, route the
+close ones to a panel, spend the testing budget only where the model is unsure.
+(`output/decision/budget_curve.png`)
+
+## Does it transfer?
+
+Two tests that this is a general human-response recipe, not a memorability one-off.
+
+**Out-of-distribution creative.** Trained on LaMem photos, run on real ad creative
+(Pitt Image Ads). The feature-space OOD distance separates ads from in-distribution
+photos at **AUROC 0.929**, while the model's own variance cannot (0.50). At a
+5%-false-positive operating point it routes 70% of ad creative to deferral and leaves
+in-domain accuracy intact. The deployment rule: a photo-trained model should defer on
+creative unlike its training data, and this is the signal that catches it.
+
+**A second human-response signal.** The same recipe applied to AVA aesthetics (50+
+votes per image) predicts the human-mean rating at Spearman 0.631, and conformal
+coverage still holds. The intrinsic variance doesn't capture human *disagreement*
+(0.08), but a head trained directly on the vote-spread recovers part of it (0.28) from
+the image alone.
+
+## Where it fails
+
+A content-level reliability map (CLIP zero-shot categories). The 90% coverage holds
+across every content type (0.88 to 0.94); the error does not. The model is least
+trustworthy on outdoor/nature (MAE 0.084, where it systematically over-predicts) and
+most on faces/portraits (0.059). This is the actionable map: auto-score the reliable
+content, route the rest. (`output/taxonomy/taxonomy.png`)
 
 ## Run it
 
-```bash
-pip install -r requirements.txt
-python -m pytest -q              # unit tests: perturbations, matching, AP, D-ECE
-python -m src.run_local_smoke    # no-GPU end-to-end on synthetic thermal + a blob detector
+```sh
+pip install modal && modal setup
+modal run modal_run.py --model-name clip_ridge                 # main: accuracy + trust layer
+modal run modal_run.py --all-splits --model-name clip_ridge    # cross-split variance
+modal run modal_run.py --decision --model-name clip_ridge      # creative selection under budget
+modal run modal_run.py --shift --model-name clip_ridge         # OOD-gated routing on ad creative
+modal run modal_run.py --ava --model-name clip_ridge           # second human-response signal
+modal run modal_run.py --taxonomy --model-name clip_ridge      # content-level failure map
 ```
 
-Then on Modal (uses your account and GPU credits):
+LaMem downloads into a Modal volume once (a few minutes); later runs reuse it. Reports
+and plots land in `output/`.
 
-```bash
-pip install modal && modal setup                         # once
-modal run modal_app.py::inspect                          # confirm HIT-UAV layout, no GPU
-modal run modal_app.py::main --epochs 20 --max-test-images 300
-modal run modal_app.py::main --max-test-images 300 --model yolov8s.pt   # the model A/B
-```
+## Honest scope
 
-Each run writes `records.csv`, `aggregate.csv`, and `integrity_summary.csv` to the Modal volume
-(under `results_thermal_<model>/`) and prints the baseline, the integrity summary, the control
-check, and the risk-coverage table.
-
-## Downstream: publishing into Lattice
-
-[`lattice/`](lattice/) takes the result one level up the stack and maps
-detections onto real Anduril Lattice `Entity` objects (via `anduril-lattice-sdk`),
-but gated by the finding. Because the study showed the confidence is
-untrustworthy under degradation and the detector fails by going blind, a naive
-shim would be unsafe: Lattice has no confidence field to put the score in, and on
-the worst frames a blind detector publishing almost nothing reads to an operator
-as "area clear". So the mapper runs a trust gate off the measured reliability,
-asserts a track's disposition only as hard as the regime earns, and on blind
-frames suppresses the boxes and flips the producer's own `health` to FAIL instead
-of going silent. Runs with no credentials against a mock transport:
-
-```bash
-python -m lattice.publish --severity 1.0     # the trusted/degraded/blind split + scorecard
-```
-
-See [`lattice/README.md`](lattice/README.md) for what is real (the SDK types and
-field mapping, validated in tests) and what is stubbed and labelled (geolocation,
-the live transport).
-
-## Method
-
-- **True vs reported quality.** True quality is mAP@0.5 against the real boxes. Reported quality is
-  the detector's box confidence, scored with detection ECE (D-ECE): bin detections by confidence,
-  compare each bin's confidence to the fraction that are true positives.
-- **Perturbations** are the field failure modes, all photometric so the ground-truth boxes stay
-  fixed across the whole sweep: `range_detail_loss`, `atmospheric_blur`, `low_contrast`,
-  `sensor_noise`, `motion_blur`.
-- **Dead control.** `background_marks` alters only pixels where there are no targets. If mAP drops
-  under it, the detector is reacting to background; that drop is the noise floor the real
-  degradations have to clear. Here it moves mAP ~3–4 points while the real degradations move it
-  40–90.
-
-This is the reported-vs-true-quality-under-controlled-intervention method (after SkyDiscover and
-CRN-Bench) pointed at fielded perception.
-
-## Honest limits
-
-- YOLOv8n and YOLOv8s are small; both saturate at 92.2 on clean HIT-UAV, so this task does not
-  stress capacity. A harder, multi-class aerial set is the natural next dataset.
-- Perturbations are photometric; range is simulated as detail-loss at fixed box coordinates rather
-  than a true geometric rescale, which keeps labels fixed across the sweep.
-- Single class (person), one thermal dataset. The transferable finding is the pattern (confidence
-  failing to signal a recall collapse), not the exact magnitudes.
-- Confidence intervals are a frame-level bootstrap; mAP and recall are point estimates, since
-  missed targets are not in the per-detection log.
-
-## Layout
-
-```
-modal_app.py            fine-tune + audit on Modal; local entrypoints `main` and `inspect`
-src/perturbations.py    field degradations + the dead control (box-preserving)
-src/dataset.py          YOLO-split loader (HIT-UAV test) + synthetic thermal source
-src/detect.py           detections + IoU / TP-FP matching
-src/metrics.py          mAP, D-ECE, risk-coverage, integrity summary, control check
-src/eval.py             the perturbation sweep (one loop, smoke and Modal)
-lattice/                maps detections onto Lattice Entities, gated by the finding
-tests/                  perturbation, metric, and Lattice-mapping unit tests
-```
+LaMem memorability comes from a memory-game study, not ad recall or neural response,
+so this demonstrates the *method* on the closest public proxy, not ad lift. The point
+is the shape of the system: a calibrated human-response predictor that reports its own
+trust, defers on unfamiliar creative, and turns its confidence into a selection
+decision. On a lab's own response data, every curve here (the selection budget, the
+disagreement head, the content map) would be measured directly against that target.
